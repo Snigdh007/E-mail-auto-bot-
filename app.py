@@ -6,6 +6,7 @@ from flask import Flask, render_template_string, request, jsonify
 import threading
 import time
 from datetime import datetime
+import socket
 
 app = Flask(__name__)
 
@@ -27,35 +28,76 @@ class EmailBot:
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         log_entry = f"[{timestamp}] {message}"
         self.logs.append(log_entry)
-        if len(self.logs) > 50:  # Keep only last 50 logs
+        if len(self.logs) > 50:
             self.logs.pop(0)
         print(log_entry)
     
     def send_reply(self, to_email, subject):
-        try:
-            server = smtplib.SMTP("smtp.gmail.com", 587)
-            server.starttls()
-            server.login(self.user_email, self.app_password)
-            
-            msg = MIMEText(self.reply_message)
-            msg['From'] = self.user_email
-            msg['To'] = to_email
-            msg['Subject'] = f"Re: {subject}"
-            
-            server.send_message(msg)
-            server.quit()
-            
-            self.log(f"✅ Reply sent to: {to_email}")
-            return True
-        except Exception as e:
-            self.log(f"❌ Send failed: {e}")
-            return False
+        max_retries = 3
+        retry_delay = 5
+        
+        for attempt in range(max_retries):
+            try:
+                # Set socket timeout
+                socket.setdefaulttimeout(30)
+                
+                server = smtplib.SMTP("smtp.gmail.com", 587, timeout=30)
+                server.set_debuglevel(0)
+                server.starttls()
+                server.login(self.user_email, self.app_password)
+                
+                msg = MIMEText(self.reply_message)
+                msg['From'] = self.user_email
+                msg['To'] = to_email
+                msg['Subject'] = f"Re: {subject}"
+                
+                server.send_message(msg)
+                server.quit()
+                
+                self.log(f"✅ Reply sent to: {to_email}")
+                return True
+                
+            except socket.timeout:
+                self.log(f"⏱️ Timeout on attempt {attempt + 1}/{max_retries}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    continue
+                    
+            except socket.gaierror as e:
+                self.log(f"🌐 DNS error (attempt {attempt + 1}/{max_retries}): Network issue")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    continue
+                    
+            except OSError as e:
+                if "Network is unreachable" in str(e):
+                    self.log(f"📡 Network unreachable (attempt {attempt + 1}/{max_retries})")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay * 2)  # Wait longer for network issues
+                        continue
+                else:
+                    self.log(f"❌ Network error: {e}")
+                    
+            except smtplib.SMTPAuthenticationError:
+                self.log(f"🔑 Authentication failed - Check your app password!")
+                return False
+                
+            except Exception as e:
+                self.log(f"❌ Send failed (attempt {attempt + 1}/{max_retries}): {type(e).__name__}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    continue
+        
+        self.log(f"❌ Failed to send after {max_retries} attempts")
+        return False
     
     def check_emails(self):
         self.log(f"🔍 Checking emails...")
         
         try:
-            mail = imaplib.IMAP4_SSL("imap.gmail.com")
+            socket.setdefaulttimeout(30)
+            
+            mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=30)
             mail.login(self.user_email, self.app_password)
             mail.select('inbox')
             
@@ -64,7 +106,8 @@ class EmailBot:
             
             self.log(f"Found {len(email_ids)} unread emails")
             
-            for email_id in email_ids[-5:]:
+            # Process only last 3 emails to avoid overwhelming
+            for email_id in email_ids[-3:]:
                 try:
                     status, msg_data = mail.fetch(email_id, '(RFC822)')
                     email_message = email.message_from_bytes(msg_data[0][1])
@@ -81,10 +124,16 @@ class EmailBot:
                     if email_message.is_multipart():
                         for part in email_message.walk():
                             if part.get_content_type() == "text/plain":
-                                email_body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                                break
+                                try:
+                                    email_body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                                    break
+                                except:
+                                    continue
                     else:
-                        email_body = email_message.get_payload(decode=True).decode('utf-8', errors='ignore')
+                        try:
+                            email_body = email_message.get_payload(decode=True).decode('utf-8', errors='ignore')
+                        except:
+                            email_body = ""
                     
                     email_text = f"{subject} {email_body}".lower()
                     
@@ -92,21 +141,32 @@ class EmailBot:
                     for keyword in self.keywords:
                         if keyword in email_text:
                             self.log(f"🎯 KEYWORD FOUND: {keyword}")
+                            # Add small delay before sending
+                            time.sleep(2)
                             self.send_reply(from_email, subject)
                             keyword_found = True
                             break
                     
                     if not keyword_found:
                         self.log(f"No keywords found in this email")
+                    
+                    # Small delay between processing emails
+                    time.sleep(1)
                         
                 except Exception as e:
-                    self.log(f"❌ Error processing email: {e}")
+                    self.log(f"❌ Error processing email: {type(e).__name__}")
                     continue
             
             mail.logout()
             
+        except socket.timeout:
+            self.log(f"⏱️ Email check timed out - will retry next cycle")
+        except socket.gaierror:
+            self.log(f"🌐 DNS error - Network connectivity issue")
+        except imaplib.IMAP4.error as e:
+            self.log(f"📧 IMAP error: {e}")
         except Exception as e:
-            self.log(f"❌ Email check failed: {e}")
+            self.log(f"❌ Email check failed: {type(e).__name__}")
     
     def run(self):
         self.running = True
@@ -116,9 +176,10 @@ class EmailBot:
         while self.running:
             try:
                 self.check_emails()
+                self.log(f"⏳ Waiting {self.interval} seconds...")
                 time.sleep(self.interval)
             except Exception as e:
-                self.log(f"❌ Error in bot loop: {e}")
+                self.log(f"❌ Error in bot loop: {type(e).__name__}")
                 time.sleep(10)
     
     def start(self):
@@ -275,6 +336,11 @@ HTML_TEMPLATE = '''
         </div>
 
         <div class="card">
+            <div class="warning">
+                <strong>⚠️ Network Issues on Free Hosting:</strong><br>
+                Free tier servers may have network connectivity issues. The bot will retry automatically, but some emails might be missed. For reliable 24/7 operation, consider upgrading to a paid hosting plan.
+            </div>
+
             <div class="info">
                 <strong>ℹ️ How to get Gmail App Password:</strong><br>
                 1. Go to Google Account → Security<br>
@@ -297,7 +363,7 @@ HTML_TEMPLATE = '''
 
                 <div class="form-group">
                     <label>⏱️ Check Interval (seconds)</label>
-                    <input type="number" id="interval" value="60" min="30" required>
+                    <input type="number" id="interval" value="60" min="60" required>
                 </div>
 
                 <div class="form-group">
@@ -357,7 +423,6 @@ HTML_TEMPLATE = '''
                     document.getElementById('logsCard').style.display = 'block';
                     showStatus('Bot is running! 🎉', 'active');
                     
-                    // Start fetching logs
                     logInterval = setInterval(fetchLogs, 2000);
                 } else {
                     alert('Error: ' + result.error);
@@ -433,7 +498,6 @@ def start_bot():
     try:
         data = request.json
         
-        # Create bot instance
         bot = EmailBot(
             user_email=data['email'],
             app_password=data['password'],
@@ -442,15 +506,14 @@ def start_bot():
             interval=data['interval']
         )
         
-        # Test connection first
         try:
-            mail = imaplib.IMAP4_SSL("imap.gmail.com")
+            socket.setdefaulttimeout(30)
+            mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=30)
             mail.login(data['email'], data['password'])
             mail.logout()
         except Exception as e:
             return jsonify({'success': False, 'error': f'Login failed: {str(e)}'})
         
-        # Generate bot ID and start
         bot_id = f"{data['email']}_{int(time.time())}"
         active_bots[bot_id] = bot
         bot.start()
